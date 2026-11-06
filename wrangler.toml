@@ -1,0 +1,36 @@
+name = "gemara-reader"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# Keep settings added in the Cloudflare dashboard (like GRADER_URL) when GitHub deploys.
+keep_vars = true
+
+# Student and teacher pages (plain HTML/JS, no build step)
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# Students, levels, readings, attempts, scores, feedback
+[[d1_databases]]
+binding = "DB"
+database_name = "gemara-reader-db"
+database_id = "cc61fca6-2eb9-4f42-9b36-34eec448dd11"
+
+# Audio recordings (deleted automatically after 7 days)
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "gemara-reader-recordings"
+
+# Runs every hour: deletes recordings older than 7 days and
+# moves stuck gradings to the teacher's manual queue.
+[triggers]
+crons = ["17 * * * *"]
+
+# Optional settings for the AI grader. Set these in the Cloudflare
+# dashboard (Settings > Variables and Secrets) when the grader is ready:
+#   GRADER_URL              address the recording is sent to
+#   GRADER_KEY              (secret) sent as "Authorization: Bearer <key>"
+#   GRADER_TIMEOUT_SECONDS  how long to wait before sending to manual grading (default 120)
+#
+# Required secret:
+#   TEACHER_CODE            the teacher's access code
