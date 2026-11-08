@@ -1,7 +1,7 @@
 import { gradeRecording, graderConnected, graderTimeoutSeconds } from "./grader.js";
 
 // ---------------------------------------------------------------------------
-// Database schema (created automatically on first request)
+// Database schema (created and updated automatically on first request)
 // ---------------------------------------------------------------------------
 
 const SCHEMA = [
@@ -17,24 +17,22 @@ const SCHEMA = [
      level_id INTEGER,
      active INTEGER NOT NULL DEFAULT 1,
      created_at TEXT NOT NULL)`,
+  // One row per school day: the material, which parts are on, the shared quiz,
+  // and which sources each level reads.
   `CREATE TABLE IF NOT EXISTS days (
      date TEXT PRIMARY KEY,
      gemara TEXT, rashi TEXT, tosfos TEXT,
+     parts TEXT,
+     questions TEXT,
+     level_sources TEXT,
      updated_at TEXT)`,
-  `CREATE TABLE IF NOT EXISTS readings (
-     id INTEGER PRIMARY KEY AUTOINCREMENT,
-     date TEXT NOT NULL,
-     level_id INTEGER NOT NULL,
-     source_type TEXT NOT NULL DEFAULT 'gemara',
-     text TEXT NOT NULL DEFAULT '',
-     questions TEXT NOT NULL DEFAULT '[]',
-     updated_at TEXT,
-     UNIQUE(date, level_id))`,
   `CREATE TABLE IF NOT EXISTS retries (
      student_id INTEGER NOT NULL,
      date TEXT NOT NULL,
      extra INTEGER NOT NULL DEFAULT 0,
      PRIMARY KEY (student_id, date))`,
+  // One row per student per try. Everything the student saw is copied in,
+  // so later edits to the day don't change old results.
   `CREATE TABLE IF NOT EXISTS attempts (
      id INTEGER PRIMARY KEY AUTOINCREMENT,
      student_id INTEGER NOT NULL,
@@ -42,38 +40,88 @@ const SCHEMA = [
      date TEXT NOT NULL,
      level_id INTEGER,
      level_name TEXT,
-     reading_id INTEGER,
-     source_type TEXT,
+     parts TEXT,
+     sources TEXT,
+     reading_parts TEXT,
      reading_text TEXT,
      quiz TEXT,
+     submitted_at TEXT NOT NULL,
+     recorded_at TEXT,
      audio_key TEXT,
      audio_type TEXT,
      audio_deleted INTEGER NOT NULL DEFAULT 0,
      duration_sec REAL,
-     submitted_at TEXT NOT NULL,
-     grading_status TEXT NOT NULL DEFAULT 'pending',
+     grading_status TEXT NOT NULL DEFAULT 'waiting',
      grading_note TEXT,
      ai_feedback TEXT,
      ai_score REAL,
      graded_at TEXT,
+     rating_inside INTEGER,
+     rating_outside INTEGER,
+     hasmada INTEGER,
+     ratings_at TEXT,
      quiz_answers TEXT,
      quiz_correct INTEGER,
      quiz_total INTEGER,
+     quiz_percent INTEGER,
      quiz_at TEXT,
+     completed_at TEXT,
      manual_feedback TEXT,
      manual_score REAL,
-     manual_at TEXT)`,
+     manual_at TEXT,
+     reading_id INTEGER,
+     source_type TEXT)`,
   `CREATE INDEX IF NOT EXISTS idx_attempts_date ON attempts(date)`,
   `CREATE INDEX IF NOT EXISTS idx_attempts_student_date ON attempts(student_id, date)`,
 ];
 
+// Columns added after the first version. Databases created by the first
+// version get them added automatically.
+const ADDED_COLUMNS = {
+  days: [["parts", "TEXT"], ["questions", "TEXT"], ["level_sources", "TEXT"]],
+  attempts: [
+    ["parts", "TEXT"], ["sources", "TEXT"], ["reading_parts", "TEXT"], ["recorded_at", "TEXT"],
+    ["rating_inside", "INTEGER"], ["rating_outside", "INTEGER"], ["hasmada", "INTEGER"], ["ratings_at", "TEXT"],
+    ["quiz_percent", "INTEGER"], ["completed_at", "TEXT"],
+  ],
+};
+
+async function migrate(env) {
+  for (const [table, columns] of Object.entries(ADDED_COLUMNS)) {
+    const { results } = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
+    const have = new Set(results.map((r) => r.name));
+    for (const [name, type] of columns) {
+      if (have.has(name)) continue;
+      try {
+        await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`).run();
+      } catch (err) {
+        if (!String(err && err.message).includes("duplicate column")) throw err;
+      }
+      if (table === "attempts" && name === "completed_at") {
+        // Results saved by the first version count as finished.
+        await env.DB.prepare(
+          `UPDATE attempts SET
+             completed_at = COALESCE(quiz_at, submitted_at),
+             recorded_at = COALESCE(recorded_at, submitted_at),
+             parts = COALESCE(parts, '{"reading":true,"ratings":false,"quiz":true}'),
+             sources = COALESCE(sources, json_array(COALESCE(source_type, 'gemara'))),
+             quiz_percent = CASE WHEN quiz_total > 0 THEN CAST(ROUND(quiz_correct * 100.0 / quiz_total) AS INTEGER) END
+           WHERE completed_at IS NULL`
+        ).run();
+      }
+    }
+  }
+}
+
 let schemaReady = null;
 function ensureSchema(env) {
   if (!schemaReady) {
-    schemaReady = env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s))).catch((err) => {
-      schemaReady = null;
-      throw err;
-    });
+    schemaReady = env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s)))
+      .then(() => migrate(env))
+      .catch((err) => {
+        schemaReady = null;
+        throw err;
+      });
   }
   return schemaReady;
 }
@@ -88,6 +136,7 @@ const RECORDING_KEEP_DAYS = 7;
 const TEACHER_SESSION_HOURS = 12;
 const DEVICE_SESSION_DAYS = 365;
 const SOURCE_TYPES = ["gemara", "rashi", "tosfos"];
+const DEFAULT_PARTS = { reading: true, ratings: true, quiz: true };
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -278,8 +327,13 @@ async function isUnlockedDevice(c) {
 }
 
 // ---------------------------------------------------------------------------
-// Readings, quizzes and attempts
+// Day setup: material, parts, shared quiz, what each level reads
 // ---------------------------------------------------------------------------
+
+function normalizeParts(p) {
+  if (!p || typeof p !== "object") return { ...DEFAULT_PARTS };
+  return { reading: p.reading !== false, ratings: p.ratings !== false, quiz: p.quiz !== false };
+}
 
 function normalizeQuestions(input) {
   const list = Array.isArray(input) ? input : [];
@@ -291,7 +345,7 @@ function normalizeQuestions(input) {
     out.push({
       q: cleanText(q.q, 2000),
       choices: [0, 1, 2].map((j) => cleanText(choices[j], 1000)),
-      correct: [0, 1, 2].includes(correct) ? correct : null,
+      correct: q.correct !== null && q.correct !== undefined && [0, 1, 2].includes(correct) ? correct : null,
     });
   }
   return out;
@@ -305,11 +359,57 @@ function questionsComplete(questions) {
   );
 }
 
-function readingReady(reading) {
-  return Boolean(reading && reading.text && reading.text.trim() && questionsComplete(parseJson(reading.questions, [])));
+function normalizeSources(list) {
+  const set = new Set(Array.isArray(list) ? list : []);
+  return SOURCE_TYPES.filter((s) => set.has(s));
 }
 
-// What the student is allowed to see: no correct answers.
+function normalizeLevelSources(obj) {
+  const out = {};
+  for (const [levelId, list] of Object.entries(obj && typeof obj === "object" ? obj : {})) {
+    if (toId(levelId)) out[Number(levelId)] = normalizeSources(list);
+  }
+  return out;
+}
+
+async function loadDay(env, date) {
+  const day = await env.DB.prepare("SELECT * FROM days WHERE date = ?").bind(date).first();
+  let levelSources = day ? parseJson(day.level_sources, null) : null;
+  let copiedFrom = null;
+  if (!levelSources) {
+    // Levels usually read the same parts every day, so start from the last day that was set.
+    const prev = await env.DB.prepare(
+      "SELECT date, level_sources FROM days WHERE date < ? AND level_sources IS NOT NULL ORDER BY date DESC LIMIT 1"
+    ).bind(date).first();
+    if (prev) {
+      levelSources = parseJson(prev.level_sources, {});
+      copiedFrom = prev.date;
+    }
+  }
+  return {
+    date,
+    saved: Boolean(day),
+    material: { gemara: day?.gemara || "", rashi: day?.rashi || "", tosfos: day?.tosfos || "" },
+    parts: normalizeParts(day ? parseJson(day.parts, null) : null),
+    questions: normalizeQuestions(day ? parseJson(day.questions, []) : []),
+    level_sources: normalizeLevelSources(levelSources),
+    sources_copied_from: copiedFrom,
+    updated_at: day?.updated_at || null,
+  };
+}
+
+// What a level reads on a day, and whether it's ready.
+function readingForLevel(day, levelId) {
+  const sources = day.level_sources[levelId] || [];
+  const parts = sources.map((s) => ({ source: s, text: day.material[s] || "" }));
+  const missing = parts.filter((p) => !p.text.trim()).map((p) => p.source);
+  return { sources, parts, ready: sources.length > 0 && missing.length === 0, missing };
+}
+
+// ---------------------------------------------------------------------------
+// Attempts
+// ---------------------------------------------------------------------------
+
 function publicQuestions(quizJson) {
   return parseJson(quizJson, []).map((q) => ({ q: q.q, choices: q.choices }));
 }
@@ -317,12 +417,7 @@ function publicQuestions(quizJson) {
 function quizDetail(a) {
   const quiz = parseJson(a.quiz, []);
   const answers = parseJson(a.quiz_answers, null);
-  return quiz.map((q, i) => ({
-    q: q.q,
-    choices: q.choices,
-    correct: q.correct,
-    answer: answers ? answers[i] : null,
-  }));
+  return quiz.map((q, i) => ({ q: q.q, choices: q.choices, correct: q.correct, answer: answers ? answers[i] : null }));
 }
 
 // A grading that never finished counts as "needs manual grading".
@@ -331,7 +426,7 @@ function staleCutoffIso(env) {
 }
 
 function effectiveStatus(env, a) {
-  if ((a.grading_status === "pending" || a.grading_status === "grading") && a.submitted_at < staleCutoffIso(env)) {
+  if ((a.grading_status === "pending" || a.grading_status === "grading") && (a.recorded_at || a.submitted_at) < staleCutoffIso(env)) {
     return "manual";
   }
   return a.grading_status;
@@ -349,39 +444,93 @@ async function getActiveStudent(env, id) {
   return s;
 }
 
+// The next thing the student has to do in this attempt.
+function nextStep(a) {
+  const parts = normalizeParts(parseJson(a.parts, null));
+  if (parts.reading && !a.recorded_at) return "reading";
+  if (parts.ratings && !a.ratings_at) return "ratings";
+  if (parts.quiz && !a.quiz_at) return "quiz";
+  return "finish";
+}
+
+function attemptState(a) {
+  const step = nextStep(a);
+  return {
+    attempt_id: a.id,
+    step,
+    parts: normalizeParts(parseJson(a.parts, null)),
+    reading: step === "reading" ? { parts: parseJson(a.reading_parts, []) } : null,
+    questions: step === "quiz" ? publicQuestions(a.quiz) : null,
+    grading_status: a.grading_status,
+    max_seconds: MAX_RECORDING_SECONDS,
+  };
+}
+
+// After each step: mark the attempt finished once every part that was on is done.
+async function advance(env, id) {
+  let a = await getAttempt(env, id);
+  if (nextStep(a) === "finish" && !a.completed_at) {
+    await env.DB.prepare("UPDATE attempts SET completed_at = ? WHERE id = ? AND completed_at IS NULL").bind(nowIso(), id).run();
+    a = await getAttempt(env, id);
+  }
+  return attemptState(a);
+}
+
+async function requireOpenAttempt(env, id) {
+  const a = await getAttempt(env, requireId(id, "attempt"));
+  if (a.completed_at) throw new HttpError(409, "You already finished this. Tap Done.");
+  return a;
+}
+
 async function todaysAttemptInfo(env, studentId, date) {
   const { results } = await env.DB.prepare(
-    "SELECT id, quiz_at FROM attempts WHERE student_id = ? AND date = ? ORDER BY id DESC"
+    "SELECT id, completed_at FROM attempts WHERE student_id = ? AND date = ? ORDER BY id DESC"
   ).bind(studentId, date).all();
   const retry = await env.DB.prepare("SELECT extra FROM retries WHERE student_id = ? AND date = ?").bind(studentId, date).first();
-  const allowed = 1 + (retry ? retry.extra : 0);
-  const open = results.find((r) => !r.quiz_at) || null;
-  return { count: results.length, allowed, open };
+  return {
+    finished: results.filter((r) => r.completed_at).length,
+    allowed: 1 + (retry ? retry.extra : 0),
+    open: results.find((r) => !r.completed_at) || null,
+  };
+}
+
+function hasProgress(a) {
+  return Boolean(a.recorded_at || a.ratings_at || a.quiz_at);
 }
 
 function teacherAttemptView(env, a, full) {
+  const parts = normalizeParts(parseJson(a.parts, null));
   const view = {
     id: a.id,
     student_id: a.student_id,
     student_name: a.current_name || a.student_name,
     date: a.date,
     level_name: a.level_name,
-    source_type: a.source_type,
+    parts,
+    sources: parseJson(a.sources, []),
     submitted_at: a.submitted_at,
+    completed_at: a.completed_at,
+    completed: Boolean(a.completed_at),
+    recorded: Boolean(a.recorded_at),
     duration_sec: a.duration_sec,
-    grading_status: effectiveStatus(env, a),
+    grading_status: parts.reading ? (a.recorded_at ? effectiveStatus(env, a) : "waiting") : "none",
     grading_note: a.grading_note,
     ai_score: a.ai_score,
     manual_score: a.manual_score,
     has_ai_feedback: Boolean(a.ai_feedback),
     has_manual_feedback: Boolean(a.manual_feedback),
+    rating_inside: a.rating_inside,
+    rating_outside: a.rating_outside,
+    hasmada: a.hasmada,
+    ratings_done: Boolean(a.ratings_at),
     quiz_correct: a.quiz_correct,
     quiz_total: a.quiz_total,
+    quiz_percent: a.quiz_percent,
     quiz_done: Boolean(a.quiz_at),
     audio_available: Boolean(a.audio_key) && !a.audio_deleted,
   };
   if (full) {
-    view.reading_text = a.reading_text;
+    view.reading_parts = parseJson(a.reading_parts, null) || (a.reading_text ? [{ source: (view.sources[0] || "gemara"), text: a.reading_text }] : []);
     view.ai_feedback = a.ai_feedback;
     view.manual_feedback = a.manual_feedback;
     view.quiz = quizDetail(a);
@@ -445,7 +594,10 @@ route("GET", "/api/student/roster", "device", async (c) => {
   const { DB } = c.env;
   const students = (await DB.prepare("SELECT id, name FROM students WHERE active = 1 ORDER BY name COLLATE NOCASE").all()).results;
   const counts = (await DB.prepare(
-    `SELECT student_id, COUNT(*) AS n, SUM(CASE WHEN quiz_at IS NULL THEN 1 ELSE 0 END) AS open
+    `SELECT student_id,
+            SUM(CASE WHEN completed_at IS NOT NULL THEN 1 ELSE 0 END) AS done,
+            SUM(CASE WHEN completed_at IS NULL AND (recorded_at IS NOT NULL OR ratings_at IS NOT NULL OR quiz_at IS NOT NULL)
+                     THEN 1 ELSE 0 END) AS progress
        FROM attempts WHERE date = ? GROUP BY student_id`
   ).bind(c.today).all()).results;
   const retries = (await DB.prepare("SELECT student_id, extra FROM retries WHERE date = ?").bind(c.today).all()).results;
@@ -457,39 +609,61 @@ route("GET", "/api/student/roster", "device", async (c) => {
     students: students.map((s) => {
       const info = countBy.get(s.id);
       let status = "ready";
-      if (info && info.open > 0) status = "resume";
-      else if (info && info.n >= 1 + (extraBy.get(s.id) || 0)) status = "done";
+      if (info && info.progress > 0) status = "resume";
+      else if (info && info.done >= 1 + (extraBy.get(s.id) || 0)) status = "done";
       return { id: s.id, name: s.name, status };
     }),
   };
 });
 
 route("POST", "/api/student/start", "device", async (c) => {
+  const { env } = c;
   const { student_id } = await readJson(c.request);
-  const student = await getActiveStudent(c.env, requireId(student_id, "student"));
-  const info = await todaysAttemptInfo(c.env, student.id, c.today);
-
-  if (info.open) {
-    const a = await getAttempt(c.env, info.open.id);
-    return { mode: "quiz", attempt_id: a.id, student: { id: student.id, name: student.name }, questions: publicQuestions(a.quiz) };
-  }
-  if (info.count >= info.allowed) throw new HttpError(409, "You already finished today. Great job.");
+  const student = await getActiveStudent(env, requireId(student_id, "student"));
+  const info = await todaysAttemptInfo(env, student.id, c.today);
 
   const level = student.level_id
-    ? await c.env.DB.prepare("SELECT id, name FROM levels WHERE id = ? AND active = 1").bind(student.level_id).first()
+    ? await env.DB.prepare("SELECT id, name FROM levels WHERE id = ? AND active = 1").bind(student.level_id).first()
     : null;
-  if (!level) throw new HttpError(409, "Your teacher hasn’t set your level yet. Let your teacher know.");
 
-  const reading = await c.env.DB.prepare("SELECT * FROM readings WHERE date = ? AND level_id = ?").bind(c.today, level.id).first();
-  if (!readingReady(reading)) throw new HttpError(409, "Today’s reading for your level isn’t ready yet. Let your teacher know.");
+  // Pick up where they left off.
+  if (info.open) {
+    const state = await advance(env, info.open.id);
+    if (state.step !== "finish") {
+      const a = await getAttempt(env, info.open.id);
+      return { ...state, student: { id: student.id, name: student.name }, level: { id: a.level_id, name: a.level_name } };
+    }
+    info.finished += 1;
+  }
+  if (info.finished >= info.allowed) throw new HttpError(409, "You already finished today. Great job.");
 
-  return {
-    mode: "read",
-    student: { id: student.id, name: student.name },
-    level: { id: level.id, name: level.name },
-    reading: { id: reading.id, source_type: reading.source_type, text: reading.text },
-    max_seconds: MAX_RECORDING_SECONDS,
-  };
+  const day = await loadDay(env, c.today);
+  const parts = day.parts;
+  if (!parts.reading && !parts.ratings && !parts.quiz) throw new HttpError(409, "There’s nothing to do today.");
+
+  let reading = { sources: [], parts: [] };
+  if (parts.reading) {
+    if (!level) throw new HttpError(409, "Your teacher hasn’t set your level yet. Let your teacher know.");
+    reading = readingForLevel(day, level.id);
+    if (!reading.ready) throw new HttpError(409, "Today’s reading for your level isn’t ready yet. Let your teacher know.");
+  }
+  if (parts.quiz && !questionsComplete(day.questions)) {
+    throw new HttpError(409, "Today’s quiz isn’t ready yet. Let your teacher know.");
+  }
+
+  const readingText = reading.parts.map((p) => p.text).join("\n\n");
+  const inserted = await env.DB.prepare(
+    `INSERT INTO attempts (student_id, student_name, date, level_id, level_name, parts, sources, reading_parts,
+       reading_text, quiz, submitted_at, grading_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    student.id, student.name, c.today, level ? level.id : null, level ? level.name : null,
+    JSON.stringify(parts), JSON.stringify(reading.sources), JSON.stringify(reading.parts),
+    readingText, parts.quiz ? JSON.stringify(day.questions) : null, nowIso(), parts.reading ? "waiting" : "none"
+  ).run();
+
+  const state = await advance(env, inserted.meta.last_row_id);
+  return { ...state, student: { id: student.id, name: student.name }, level: level ? { id: level.id, name: level.name } : null };
 });
 
 route("POST", "/api/student/submit", "device", async (c) => {
@@ -500,45 +674,31 @@ route("POST", "/api/student/submit", "device", async (c) => {
   } catch {
     throw new HttpError(400, "The recording didn’t arrive. Try sending it again.");
   }
-  const studentId = requireId(form.get("student_id"), "student");
-  const readingId = requireId(form.get("reading_id"), "reading");
+  const a = await requireOpenAttempt(env, form.get("attempt_id"));
+  // Already received (e.g. the network sent it twice): just move on.
+  if (a.recorded_at) return advance(env, a.id);
+  if (!normalizeParts(parseJson(a.parts, null)).reading) throw new HttpError(409, "There’s no reading today.");
+
   const audio = form.get("audio");
   if (!audio || typeof audio === "string" || audio.size === 0) throw new HttpError(400, "The recording was empty. Record again.");
   if (audio.size > MAX_UPLOAD_BYTES) throw new HttpError(413, "The recording is too large.");
 
-  const student = await getActiveStudent(env, studentId);
-  const info = await todaysAttemptInfo(env, student.id, c.today);
-  if (info.open) {
-    // Same recording sent twice (e.g. the network retried). Continue with the first one.
-    const a = await getAttempt(env, info.open.id);
-    return { attempt_id: a.id, questions: publicQuestions(a.quiz) };
-  }
-  if (info.count >= info.allowed) throw new HttpError(409, "You already finished today.");
-
-  const reading = await env.DB.prepare("SELECT * FROM readings WHERE id = ? AND date = ?").bind(readingId, c.today).first();
-  if (!readingReady(reading)) throw new HttpError(409, "Today’s reading changed. Go back and start again.");
-  const level = await env.DB.prepare("SELECT name FROM levels WHERE id = ?").bind(reading.level_id).first();
-
   const audioType = (audio.type || "audio/mp4").split(";")[0];
   const ext = audioType.includes("webm") ? "webm" : audioType.includes("ogg") ? "ogg" : "m4a";
-  const key = `recordings/${c.today}/${student.id}-${crypto.randomUUID()}.${ext}`;
+  const key = `recordings/${a.date}/${a.student_id}-${crypto.randomUUID()}.${ext}`;
   await env.BUCKET.put(key, await audio.arrayBuffer(), { httpMetadata: { contentType: audioType } });
 
   const duration = Math.min(Math.max(Number(form.get("duration")) || 0, 0), MAX_RECORDING_SECONDS + 5);
-  const inserted = await env.DB.prepare(
-    `INSERT INTO attempts (student_id, student_name, date, level_id, level_name, reading_id, source_type,
-       reading_text, quiz, audio_key, audio_type, duration_sec, submitted_at, grading_status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
-  ).bind(
-    student.id, student.name, c.today, reading.level_id, level ? level.name : null, reading.id, reading.source_type,
-    reading.text, reading.questions, key, audioType, Math.round(duration * 10) / 10, nowIso()
-  ).run();
-
-  return { attempt_id: inserted.meta.last_row_id, questions: publicQuestions(reading.questions) };
+  const saved = await env.DB.prepare(
+    `UPDATE attempts SET audio_key = ?, audio_type = ?, duration_sec = ?, recorded_at = ?, grading_status = 'pending'
+      WHERE id = ? AND recorded_at IS NULL`
+  ).bind(key, audioType, Math.round(duration * 10) / 10, nowIso(), a.id).run();
+  if (saved.meta.changes === 0) await env.BUCKET.delete(key);
+  return advance(env, a.id);
 });
 
-// The iPad calls this right after submitting, and keeps it open while the student
-// takes the quiz. The AI grader runs here.
+// The iPad calls this right after sending the recording, and keeps it open while
+// the student does the next parts. The AI grader runs here.
 route("POST", "/api/student/grade", "device", async (c) => {
   const { env } = c;
   const { attempt_id } = await readJson(c.request);
@@ -561,7 +721,7 @@ route("POST", "/api/student/grade", "device", async (c) => {
               audio: await obj.arrayBuffer(),
               audioType: a.audio_type,
               text: a.reading_text,
-              sourceType: a.source_type,
+              sourceType: parseJson(a.sources, []).join(","),
               attemptId: a.id,
             })
           : { ok: false, reason: "Recording not found" };
@@ -588,26 +748,49 @@ route("POST", "/api/student/grade", "device", async (c) => {
   return { grading_status: await work };
 });
 
+function ratingValue(value, max, label) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0 || n > max) throw new HttpError(400, `Pick a number for ${label}.`);
+  return n;
+}
+
+route("POST", "/api/student/ratings", "device", async (c) => {
+  const body = await readJson(c.request);
+  const a = await requireOpenAttempt(c.env, body.attempt_id);
+  if (nextStep(a) !== "ratings") return advance(c.env, a.id);
+  const inside = ratingValue(body.inside, 5, "reviewing inside");
+  const outside = ratingValue(body.outside, 5, "reviewing outside");
+  const hasmada = ratingValue(body.hasmada, 10, "hasmada");
+  await c.env.DB.prepare(
+    `UPDATE attempts SET rating_inside = ?, rating_outside = ?, hasmada = ?, ratings_at = ?
+      WHERE id = ? AND ratings_at IS NULL`
+  ).bind(inside, outside, hasmada, nowIso(), a.id).run();
+  return advance(c.env, a.id);
+});
+
 route("POST", "/api/student/quiz", "device", async (c) => {
   const { attempt_id, answers } = await readJson(c.request);
-  const a = await getAttempt(c.env, requireId(attempt_id, "attempt"));
-  if (a.quiz_at) throw new HttpError(409, "This quiz was already handed in.");
+  const a = await requireOpenAttempt(c.env, attempt_id);
+  if (nextStep(a) !== "quiz") return advance(c.env, a.id);
 
   const quiz = parseJson(a.quiz, []);
   if (!Array.isArray(answers) || answers.length !== quiz.length || !answers.every((x) => [0, 1, 2].includes(x))) {
     throw new HttpError(400, "Answer every question before handing in.");
   }
   const correct = quiz.reduce((n, q, i) => n + (q.correct === answers[i] ? 1 : 0), 0);
-  const saved = await c.env.DB.prepare(
-    "UPDATE attempts SET quiz_answers = ?, quiz_correct = ?, quiz_total = ?, quiz_at = ? WHERE id = ? AND quiz_at IS NULL"
-  ).bind(JSON.stringify(answers), correct, quiz.length, nowIso(), a.id).run();
-  if (saved.meta.changes === 0) throw new HttpError(409, "This quiz was already handed in.");
-  return { ok: true };
+  const percent = quiz.length ? Math.round((correct / quiz.length) * 100) : 0;
+  await c.env.DB.prepare(
+    `UPDATE attempts SET quiz_answers = ?, quiz_correct = ?, quiz_total = ?, quiz_percent = ?, quiz_at = ?
+      WHERE id = ? AND quiz_at IS NULL`
+  ).bind(JSON.stringify(answers), correct, quiz.length, percent, nowIso(), a.id).run();
+  // The student doesn't see the quiz score.
+  return advance(c.env, a.id);
 });
 
 route("GET", "/api/student/result", "device", async (c) => {
   const a = await getAttempt(c.env, requireId(c.url.searchParams.get("attempt_id"), "attempt"));
-  if (!a.quiz_at) throw new HttpError(403, "Finish the quiz first.");
+  if (!a.completed_at) throw new HttpError(403, "Finish the other parts first.");
+  if (!normalizeParts(parseJson(a.parts, null)).reading) return { grading_status: "none" };
   const status = effectiveStatus(c.env, a);
   return {
     grading_status: status,
@@ -665,7 +848,7 @@ async function manualQueueCount(env) {
   const row = await env.DB.prepare(
     `SELECT COUNT(*) AS n FROM attempts
       WHERE manual_feedback IS NULL
-        AND (grading_status = 'manual' OR (grading_status IN ('pending', 'grading') AND submitted_at < ?))`
+        AND (grading_status = 'manual' OR (grading_status IN ('pending', 'grading') AND recorded_at < ?))`
   ).bind(staleCutoffIso(env)).first();
   return row ? row.n : 0;
 }
@@ -773,8 +956,8 @@ route("DELETE", "/api/teacher/students/:id", "teacher", async (c) => {
 route("POST", "/api/teacher/students/:id/retry", "teacher", async (c) => {
   const id = requireId(c.params.id);
   await getActiveStudent(c.env, id);
-  const done = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM attempts WHERE student_id = ? AND date = ?").bind(id, c.today).first();
-  // Allowed attempts today becomes (attempts so far + 1).
+  const done = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM attempts WHERE student_id = ? AND date = ? AND completed_at IS NOT NULL").bind(id, c.today).first();
+  // Allowed tries today becomes (finished tries + 1).
   await c.env.DB.prepare(
     `INSERT INTO retries (student_id, date, extra) VALUES (?, ?, ?)
      ON CONFLICT(student_id, date) DO UPDATE SET extra = MAX(extra, excluded.extra)`
@@ -782,72 +965,55 @@ route("POST", "/api/teacher/students/:id/retry", "teacher", async (c) => {
   return { ok: true };
 });
 
-// Daily readings -------------------------------------------------------------
 
-async function loadDay(env, date) {
-  const day = await env.DB.prepare("SELECT * FROM days WHERE date = ?").bind(date).first();
-  const rows = (await env.DB.prepare("SELECT * FROM readings WHERE date = ?").bind(date).all()).results;
-  const readings = {};
-  for (const r of rows) {
-    readings[r.level_id] = {
-      source_type: r.source_type,
-      text: r.text,
-      questions: normalizeQuestions(parseJson(r.questions, [])),
-      ready: readingReady(r),
-    };
-  }
-  return {
-    date,
-    material: { gemara: day?.gemara || "", rashi: day?.rashi || "", tosfos: day?.tosfos || "" },
-    readings,
-    updated_at: day?.updated_at || null,
-  };
+// Daily setup ----------------------------------------------------------------
+
+async function dayView(env, date) {
+  const day = await loadDay(env, date);
+  const levels = await listLevels(env);
+  day.level_status = Object.fromEntries(levels.map((l) => {
+    const r = readingForLevel(day, l.id);
+    return [l.id, { ready: r.ready, sources: r.sources, missing: r.missing }];
+  }));
+  day.quiz_ready = questionsComplete(day.questions);
+  return day;
 }
 
 route("GET", "/api/teacher/day", "teacher", async (c) => {
   const date = c.url.searchParams.get("date") || c.today;
   if (!isDate(date)) throw new HttpError(400, "Pick a valid date.");
-  return loadDay(c.env, date);
+  return dayView(c.env, date);
 });
 
 route("PUT", "/api/teacher/day", "teacher", async (c) => {
-  const { DB } = c.env;
   const body = await readJson(c.request);
   if (!isDate(body.date)) throw new HttpError(400, "Pick a valid date.");
   const m = body.material || {};
-  const stamp = nowIso();
-  const statements = [
-    DB.prepare(
-      `INSERT INTO days (date, gemara, rashi, tosfos, updated_at) VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(date) DO UPDATE SET gemara = excluded.gemara, rashi = excluded.rashi, tosfos = excluded.tosfos, updated_at = excluded.updated_at`
-    ).bind(body.date, cleanText(m.gemara, 100000), cleanText(m.rashi, 100000), cleanText(m.tosfos, 100000), stamp),
-  ];
-
   const activeLevels = new Set((await listLevels(c.env)).map((l) => l.id));
-  for (const r of Array.isArray(body.readings) ? body.readings : []) {
-    const levelId = toId(r.level_id);
-    if (!levelId || !activeLevels.has(levelId)) continue;
-    const text = cleanText(r.text, 20000);
-    const questions = normalizeQuestions(r.questions);
-    const sourceType = SOURCE_TYPES.includes(r.source_type) ? r.source_type : "gemara";
-    const empty = !text && questions.every((q) => !q.q && q.choices.every((x) => !x));
-    if (empty) {
-      statements.push(DB.prepare("DELETE FROM readings WHERE date = ? AND level_id = ?").bind(body.date, levelId));
-    } else {
-      statements.push(
-        DB.prepare(
-          `INSERT INTO readings (date, level_id, source_type, text, questions, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(date, level_id) DO UPDATE SET source_type = excluded.source_type, text = excluded.text,
-             questions = excluded.questions, updated_at = excluded.updated_at`
-        ).bind(body.date, levelId, sourceType, text, JSON.stringify(questions), stamp)
-      );
-    }
-  }
-  await DB.batch(statements);
-  return loadDay(c.env, body.date);
+  const levelSources = Object.fromEntries(
+    Object.entries(normalizeLevelSources(body.level_sources)).filter(([id]) => activeLevels.has(Number(id)))
+  );
+  await c.env.DB.prepare(
+    `INSERT INTO days (date, gemara, rashi, tosfos, parts, questions, level_sources, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(date) DO UPDATE SET gemara = excluded.gemara, rashi = excluded.rashi, tosfos = excluded.tosfos,
+       parts = excluded.parts, questions = excluded.questions, level_sources = excluded.level_sources,
+       updated_at = excluded.updated_at`
+  ).bind(
+    body.date,
+    cleanText(m.gemara, 100000), cleanText(m.rashi, 100000), cleanText(m.tosfos, 100000),
+    JSON.stringify(normalizeParts(body.parts)),
+    JSON.stringify(normalizeQuestions(body.questions)),
+    JSON.stringify(levelSources),
+    nowIso()
+  ).run();
+  return dayView(c.env, body.date);
 });
 
 // Results --------------------------------------------------------------------
+
+// Tries where the student hasn't done anything yet are left out of results.
+const STARTED = "(a.recorded_at IS NOT NULL OR a.ratings_at IS NOT NULL OR a.quiz_at IS NOT NULL)";
 
 route("GET", "/api/teacher/attempts", "teacher", async (c) => {
   const q = c.url.searchParams;
@@ -858,7 +1024,7 @@ route("GET", "/api/teacher/attempts", "teacher", async (c) => {
   const ids = (q.get("students") || "").split(",").map(toId).filter(Boolean);
 
   let sql = `SELECT a.*, s.name AS current_name FROM attempts a LEFT JOIN students s ON s.id = a.student_id
-             WHERE a.date >= ? AND a.date <= ?`;
+             WHERE a.date >= ? AND a.date <= ? AND ${STARTED}`;
   const args = [from, to];
   if (ids.length) {
     sql += ` AND a.student_id IN (${ids.map(() => "?").join(",")})`;
@@ -881,8 +1047,8 @@ route("GET", "/api/teacher/manual", "teacher", async (c) => {
   const rows = (await c.env.DB.prepare(
     `SELECT a.*, s.name AS current_name FROM attempts a LEFT JOIN students s ON s.id = a.student_id
       WHERE a.manual_feedback IS NULL
-        AND (a.grading_status = 'manual' OR (a.grading_status IN ('pending', 'grading') AND a.submitted_at < ?))
-      ORDER BY a.submitted_at`
+        AND (a.grading_status = 'manual' OR (a.grading_status IN ('pending', 'grading') AND a.recorded_at < ?))
+      ORDER BY a.recorded_at`
   ).bind(staleCutoffIso(c.env)).all()).results;
   return { attempts: rows.map((a) => teacherAttemptView(c.env, a, true)) };
 });
@@ -949,7 +1115,7 @@ async function cleanup(env) {
   const cutoff = new Date(Date.now() - RECORDING_KEEP_DAYS * 86400000).toISOString();
   for (;;) {
     const { results } = await env.DB.prepare(
-      "SELECT id, audio_key FROM attempts WHERE audio_deleted = 0 AND audio_key IS NOT NULL AND submitted_at < ? LIMIT 500"
+      "SELECT id, audio_key FROM attempts WHERE audio_deleted = 0 AND audio_key IS NOT NULL AND recorded_at < ? LIMIT 500"
     ).bind(cutoff).all();
     if (!results.length) break;
     await env.BUCKET.delete(results.map((r) => r.audio_key));
@@ -959,7 +1125,7 @@ async function cleanup(env) {
 
   await env.DB.prepare(
     `UPDATE attempts SET grading_status = 'manual', grading_note = COALESCE(grading_note, 'AI grading never finished'), graded_at = ?
-      WHERE grading_status IN ('pending', 'grading') AND submitted_at < ?`
+      WHERE grading_status IN ('pending', 'grading') AND recorded_at < ?`
   ).bind(nowIso(), staleCutoffIso(env)).run();
 }
 

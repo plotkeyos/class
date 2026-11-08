@@ -561,3 +561,47 @@ dialog::backdrop { background: rgba(24, 33, 43, .45); }
   #print-report .fb { break-inside: avoid; margin-bottom: 10pt; padding-bottom: 8pt; border-bottom: 0.5pt solid #ccc; }
   #print-report .fb p { white-space: pre-wrap; unicode-bidi: plaintext; }
 }
+
+/* Several parts (Gemara, Rashi, Tosfos) on one page */
+.page .part + .part { margin-top: 30px; padding-top: 6px; }
+
+/* 0–5 and 0–10 scales */
+.scale { display: grid; gap: 8px; }
+.scale-5 { grid-template-columns: repeat(6, 1fr); }
+.scale-10 { grid-template-columns: repeat(11, 1fr); }
+.scale-btn {
+  min-height: 60px;
+  border-radius: var(--r-s);
+  border: 2px solid var(--line);
+  background: var(--surface);
+  font-size: 1.35rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.scale-btn[aria-checked="true"] { border-color: var(--binding); background: var(--binding); color: #fff; }
+@media (max-width: 600px) {
+  .scale-10 { grid-template-columns: repeat(6, 1fr); }
+}
+
+/* Daily setup */
+.toggles { display: grid; gap: 10px; }
+.toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1.5px solid var(--line);
+  border-radius: var(--r-s);
+  cursor: pointer;
+}
+.toggle input { width: 24px; height: 24px; margin-top: 1px; accent-color: var(--binding); flex: none; }
+.toggle > span { display: grid; gap: 2px; }
+.toggle:has(input:checked) { border-color: var(--binding); background: var(--binding-soft); }
+td.num { font-variant-numeric: tabular-nums; }
+.read-part + .read-part { margin-top: 14px; }
+.read-source { display: block; color: var(--gilt); font-size: 1.05rem; }
+table.mini { width: auto; }
+table.mini td { padding: 6px 16px 6px 0; }

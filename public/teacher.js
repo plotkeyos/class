@@ -1,4 +1,4 @@
-import { h, api, toast, SOURCE_LABELS, formatDate, formatTime, clock } from "/common.js";
+import { h, api, toast, SOURCE_LABELS, SOURCE_HEBREW, formatDate, formatTime, clock } from "/common.js";
 
 const app = document.getElementById("app");
 const dialog = document.getElementById("detail");
@@ -6,7 +6,7 @@ const printArea = document.getElementById("print-report");
 
 const TABS = [
   ["today", "Today"],
-  ["readings", "Readings"],
+  ["setup", "Daily setup"],
   ["students", "Students"],
   ["levels", "Levels"],
   ["manual", "Manual grading"],
@@ -56,6 +56,8 @@ async function guard(fn) {
 }
 
 function gradePill(a) {
+  if (a.grading_status === "none") return h("span", { class: "muted" }, "Off");
+  if (a.grading_status === "waiting") return "—";
   if (a.grading_status === "done") return h("span", { class: "pill ok" }, a.ai_score !== null && a.ai_score !== undefined ? `AI: ${a.ai_score}` : "AI graded");
   if (a.grading_status === "manual") {
     if (a.has_manual_feedback) return h("span", { class: "pill binding" }, a.manual_score !== null && a.manual_score !== undefined ? `You: ${a.manual_score}` : "Graded by you");
@@ -65,13 +67,25 @@ function gradePill(a) {
 }
 
 function gradeText(a) {
+  if (a.grading_status === "none") return "Off";
+  if (a.grading_status === "waiting") return "Not recorded";
   if (a.grading_status === "done") return "AI graded";
   if (a.grading_status === "manual") return a.has_manual_feedback ? "Graded by teacher" : "Needs manual grading";
   return "Grading";
 }
 
 function quizText(a) {
-  return a.quiz_done ? `${a.quiz_correct}/${a.quiz_total}` : "Not finished";
+  if (!a.parts.quiz) return "Off";
+  return a.quiz_done ? `${a.quiz_percent}%` : "Not finished";
+}
+
+function ratingText(a, key) {
+  if (!a.parts.ratings) return "Off";
+  return a.ratings_done ? String(a[key]) : "—";
+}
+
+function sourcesText(list) {
+  return (list || []).map((s) => SOURCE_LABELS[s]).join(" + ");
 }
 
 function emptyQuestion() {
@@ -178,7 +192,7 @@ function go(tab, force = false) {
   clearInterval(refreshTimer);
   renderNav();
   main.replaceChildren(h("div", { class: "spinner" }));
-  const render = { today: renderToday, readings: renderReadings, students: renderStudents, levels: renderLevels, manual: renderManual, reports: renderReports, settings: renderSettings }[tab];
+  const render = { today: renderToday, setup: renderSetup, students: renderStudents, levels: renderLevels, manual: renderManual, reports: renderReports, settings: renderSettings }[tab];
   render().catch(fail);
 }
 
@@ -199,31 +213,33 @@ async function renderToday() {
   ]);
   if (state.tab !== "today") return;
 
+  const notice = (text, label, tab, warn = true) =>
+    h("div", { class: `notice${warn ? " warn" : ""}` }, text, " ",
+      label ? h("button", { class: "btn small", onclick: () => go(tab) }, label) : null);
   const notices = [];
-  if (!ov.class_code) {
-    notices.push(h("div", { class: "notice warn" }, "Set a class code so the iPads can be unlocked. ",
-      h("button", { class: "btn small", onclick: () => go("settings") }, "Set class code")));
+  const p = day.parts;
+  if (!ov.class_code) notices.push(notice("Set a class code so the iPads can be unlocked.", "Set class code", "settings"));
+  if (!p.reading && !p.ratings && !p.quiz) {
+    notices.push(notice("Every part is turned off today, so students have nothing to do.", "Daily setup", "setup"));
   }
-  if (!ov.levels.length) {
-    notices.push(h("div", { class: "notice warn" }, "Add your levels first. ",
-      h("button", { class: "btn small", onclick: () => go("levels") }, "Add levels")));
+  if (p.reading) {
+    if (!ov.levels.length) notices.push(notice("Add your levels first.", "Add levels", "levels"));
+    const noLevel = ov.students.filter((s) => !s.level_id);
+    if (ov.levels.length && noLevel.length) {
+      notices.push(notice(
+        `${noLevel.length} ${noLevel.length === 1 ? "student doesn’t" : "students don’t"} have a level yet: ${noLevel.map((s) => s.name).join(", ")}.`,
+        "Set levels", "students"));
+    }
+    const used = ov.levels.filter((l) => ov.students.some((s) => s.level_id === l.id));
+    const notReady = used.filter((l) => !(day.level_status[l.id] && day.level_status[l.id].ready));
+    if (notReady.length) {
+      notices.push(notice(
+        `The reading isn’t ready for ${notReady.map((l) => l.name).join(", ")}. Students on ${notReady.length === 1 ? "that level" : "those levels"} can’t start yet.`,
+        "Daily setup", "setup"));
+    }
+    if (!ov.grader_connected) notices.push(notice("The AI grader isn’t connected yet, so every reading goes to Manual grading.", null, null, false));
   }
-  const noLevel = ov.students.filter((s) => !s.level_id);
-  if (ov.levels.length && noLevel.length) {
-    notices.push(h("div", { class: "notice warn" },
-      `${noLevel.length} ${noLevel.length === 1 ? "student doesn’t" : "students don’t"} have a level yet: ${noLevel.map((s) => s.name).join(", ")}. `,
-      h("button", { class: "btn small", onclick: () => go("students") }, "Set levels")));
-  }
-  const usedLevels = ov.levels.filter((l) => ov.students.some((s) => s.level_id === l.id));
-  const missing = usedLevels.filter((l) => !(day.readings[l.id] && day.readings[l.id].ready));
-  if (missing.length) {
-    notices.push(h("div", { class: "notice warn" },
-      `No reading is ready today for ${missing.map((l) => l.name).join(", ")}. Students on ${missing.length === 1 ? "that level" : "those levels"} can’t start yet. `,
-      h("button", { class: "btn small", onclick: () => go("readings") }, "Set today’s readings")));
-  }
-  if (!ov.grader_connected) {
-    notices.push(h("div", { class: "notice" }, "The AI grader isn’t connected yet, so every reading goes to Manual grading."));
-  }
+  if (p.quiz && !day.quiz_ready) notices.push(notice("Today’s quiz isn’t finished, so students can’t start yet.", "Daily setup", "setup"));
 
   const latest = new Map();
   const counts = new Map();
@@ -231,41 +247,47 @@ async function renderToday() {
     if (!latest.has(a.student_id)) latest.set(a.student_id, a);
     counts.set(a.student_id, (counts.get(a.student_id) || 0) + 1);
   }
-  const finished = ov.students.filter((s) => latest.get(s.id) && latest.get(s.id).quiz_done).length;
+  const finished = ov.students.filter((s) => latest.get(s.id) && latest.get(s.id).completed).length;
 
   const rows = ov.students.map((s) => {
     const a = latest.get(s.id);
     let status = h("span", { class: "pill" }, "Not started");
-    if (a && !a.quiz_done) status = h("span", { class: "pill warn" }, "Quiz not finished");
-    if (a && a.quiz_done) status = h("span", { class: "pill ok" }, `Finished ${formatTime(a.submitted_at)}`);
+    if (a && !a.completed) status = h("span", { class: "pill warn" }, "In progress");
+    if (a && a.completed) status = h("span", { class: "pill ok" }, `Finished ${formatTime(a.completed_at)}`);
     const tries = counts.get(s.id) || 0;
     return h("tr", {},
       h("td", {}, h("strong", {}, s.name)),
       h("td", {}, levelName(s.level_id)),
       h("td", {}, status, tries > 1 ? h("span", { class: "muted" }, ` (${tries} tries)`) : null),
-      h("td", {}, a && a.quiz_done ? `${a.quiz_correct}/${a.quiz_total}` : "—"),
       h("td", {}, a ? gradePill(a) : "—"),
+      h("td", {}, a ? quizText(a) : "—"),
+      h("td", { class: "num" }, a ? ratingText(a, "rating_inside") : "—"),
+      h("td", { class: "num" }, a ? ratingText(a, "rating_outside") : "—"),
+      h("td", { class: "num" }, a ? ratingText(a, "hasmada") : "—"),
       h("td", { style: { whiteSpace: "nowrap", textAlign: "right" } },
         a ? h("button", { class: "btn small", onclick: () => openDetail(a.id) }, "View") : null,
-        a ? h("button", {
+        a && a.completed ? h("button", {
           class: "btn small",
           onclick: () => guard(async () => {
             await api(`/api/teacher/students/${s.id}/retry`, { method: "POST" });
-            toast(`${s.name} can read again today.`);
+            toast(`${s.name} can do it again today.`);
           }),
         }, "Allow another try") : null));
   });
 
+  const partsOn = [p.reading && "reading", p.ratings && "review questions", p.quiz && "quiz"].filter(Boolean);
   main.replaceChildren(
     h("header", {},
-      h("div", {}, h("h2", {}, "Today"), h("p", { class: "muted" }, `${finished} of ${ov.students.length} finished. This page updates on its own.`)),
+      h("div", {},
+        h("h2", {}, "Today"),
+        h("p", { class: "muted" }, `${finished} of ${ov.students.length} finished. Parts on today: ${partsOn.length ? partsOn.join(", ") : "none"}.`)),
       h("button", { class: "btn", onclick: () => go("today", true) }, "Refresh")),
     ...notices,
     ov.students.length
       ? h("div", { class: "panel" }, h("div", { class: "table-wrap" }, h("table", {},
-          h("thead", {}, h("tr", {}, ["Student", "Level", "Status", "Quiz", "Reading grade", ""].map((t) => h("th", {}, t)))),
+          h("thead", {}, h("tr", {}, ["Student", "Level", "Status", "Reading", "Quiz", "Inside", "Outside", "Hasmada", ""].map((t) => h("th", {}, t)))),
           h("tbody", {}, rows))))
-      : h("div", { class: "panel" }, h("p", {}, "No students yet. "), h("button", { class: "btn primary", onclick: () => go("students") }, "Add students")),
+      : h("div", { class: "panel" }, h("p", {}, "No students yet."), h("div", {}, h("button", { class: "btn primary", onclick: () => go("students") }, "Add students"))),
   );
 
   clearInterval(refreshTimer);
@@ -275,31 +297,29 @@ async function renderToday() {
 }
 
 // ---------------------------------------------------------------------------
-// Readings
+// Daily setup
 // ---------------------------------------------------------------------------
 
-async function renderReadings() {
+async function renderSetup() {
   const ov = state.overview;
   const date = state.readingDate || ov.today;
   const day = await api(`/api/teacher/day?date=${date}`);
-  if (state.tab !== "readings") return;
+  if (state.tab !== "setup") return;
 
   const draft = {
     date,
+    parts: { ...day.parts },
     material: { ...day.material },
-    readings: {},
+    questions: day.questions.map((q) => ({ q: q.q, choices: [...q.choices], correct: q.correct })),
+    level_sources: Object.fromEntries(ov.levels.map((l) => [l.id, [...(day.level_sources[l.id] || [])]])),
   };
-  for (const l of ov.levels) {
-    const r = day.readings[l.id];
-    draft.readings[l.id] = r
-      ? { source_type: r.source_type, text: r.text, questions: r.questions.map((q) => ({ q: q.q, choices: [...q.choices], correct: q.correct })) }
-      : { source_type: "gemara", text: "", questions: [emptyQuestion(), emptyQuestion()] };
-  }
 
   const saveStatus = h("span", { class: "muted" }, day.updated_at ? `Last saved ${formatTime(day.updated_at)}` : "Not saved yet");
+  const statusUpdaters = [];
   const markDirty = () => {
     state.dirty = true;
     saveStatus.textContent = "Unsaved changes";
+    statusUpdaters.forEach((fn) => fn());
   };
 
   const dateInput = h("input", { type: "date", value: date, style: { width: "auto" } });
@@ -311,94 +331,116 @@ async function renderReadings() {
     }
     state.dirty = false;
     state.readingDate = dateInput.value;
-    renderReadings().catch(fail);
+    renderSetup().catch(fail);
   });
 
+  // Parts on/off
+  const partToggle = (key, label, hint) => {
+    const box = h("input", { type: "checkbox", checked: draft.parts[key] });
+    box.addEventListener("change", () => { draft.parts[key] = box.checked; markDirty(); });
+    return h("label", { class: "toggle" }, box, h("span", {}, h("strong", {}, label), h("span", { class: "muted" }, hint)));
+  };
+
+  // Material
   const materialArea = (key, label) => {
     const ta = h("textarea", { class: "hebrew", rows: 6, dir: "rtl", lang: "he", value: draft.material[key] });
     ta.addEventListener("input", () => { draft.material[key] = ta.value; markDirty(); });
     return h("label", { class: "field" }, h("span", {}, label), ta);
   };
 
-  const levelCards = ov.levels.map((l) => {
-    const r = draft.readings[l.id];
-    const studentCount = ov.students.filter((s) => s.level_id === l.id).length;
+  // What each level reads
+  const levelRows = ov.levels.map((l) => {
+    const chosen = draft.level_sources[l.id];
+    const count = ov.students.filter((s) => s.level_id === l.id).length;
     const pill = h("span", { class: "pill" });
-    const updatePill = () => {
-      const complete = r.text.trim() && r.questions.every((q) => q.q.trim() && q.choices.every((c) => c.trim()) && q.correct !== null);
-      const empty = !r.text.trim() && r.questions.every((q) => !q.q.trim() && q.choices.every((c) => !c.trim()));
-      pill.className = `pill ${complete ? "ok" : empty ? "" : "warn"}`;
-      pill.textContent = complete ? "Ready" : empty ? "Empty" : "Not finished";
+    const update = () => {
+      const missing = chosen.filter((s) => !draft.material[s].trim());
+      if (!chosen.length) { pill.className = "pill warn"; pill.textContent = "Pick at least one"; }
+      else if (missing.length) { pill.className = "pill warn"; pill.textContent = `Paste the ${sourcesText(missing)} text`; }
+      else { pill.className = "pill ok"; pill.textContent = "Ready"; }
     };
-    updatePill();
-
-    const typeButtons = Object.entries(SOURCE_LABELS).map(([key, label]) => {
-      const b = h("button", { type: "button", "aria-pressed": String(r.source_type === key) }, label);
-      b.addEventListener("click", () => {
-        r.source_type = key;
-        typeButtons.forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    statusUpdaters.push(update);
+    update();
+    const boxes = Object.entries(SOURCE_LABELS).map(([key, label]) => {
+      const box = h("input", { type: "checkbox", checked: chosen.includes(key) });
+      box.addEventListener("change", () => {
+        const set = new Set(chosen);
+        if (box.checked) set.add(key); else set.delete(key);
+        chosen.splice(0, chosen.length, ...Object.keys(SOURCE_LABELS).filter((k) => set.has(k)));
         markDirty();
       });
-      return b;
+      return h("label", {}, box, label);
     });
-
-    const text = h("textarea", { class: "hebrew", rows: 5, dir: "rtl", lang: "he", value: r.text, placeholder: "Paste the piece this level reads" });
-    text.addEventListener("input", () => { r.text = text.value; markDirty(); updatePill(); });
-
-    const qBlocks = r.questions.map((q, qi) => {
-      const qInput = h("input", { type: "text", dir: "auto", value: q.q, placeholder: "Question" });
-      qInput.addEventListener("input", () => { q.q = qInput.value; markDirty(); updatePill(); });
-      const name = `correct-${l.id}-${qi}`;
-      const rows = q.choices.map((c, ci) => {
-        const radio = h("input", { type: "radio", name, checked: q.correct === ci, "aria-label": `Choice ${ci + 1} is correct` });
-        radio.addEventListener("change", () => { q.correct = ci; markDirty(); updatePill(); });
-        const cInput = h("input", { type: "text", dir: "auto", value: c, placeholder: `Choice ${ci + 1}` });
-        cInput.addEventListener("input", () => { q.choices[ci] = cInput.value; markDirty(); updatePill(); });
-        return h("div", { class: "choice-row" }, h("label", {}, radio, "Correct"), cInput);
-      });
-      return h("div", { class: "q-block" }, h("strong", {}, `Question ${qi + 1}`), qInput, ...rows);
-    });
-
-    return h("section", { class: "panel level-card" },
-      h("header", {},
-        h("div", {}, h("h3", {}, l.name), h("span", { class: "muted" }, `${studentCount} ${studentCount === 1 ? "student" : "students"}`)),
-        pill),
-      h("div", {}, h("div", { class: "type-pick", role: "group", "aria-label": "What this level reads" }, typeButtons)),
-      h("label", { class: "field" }, h("span", {}, "Text this level reads"), text),
-      ...qBlocks);
+    return h("tr", {},
+      h("td", {}, h("strong", {}, l.name), h("div", { class: "muted" }, `${count} ${count === 1 ? "student" : "students"}`)),
+      h("td", {}, h("div", { class: "checks" }, boxes)),
+      h("td", { style: { textAlign: "right" } }, pill));
   });
 
-  const saveBtn = h("button", { class: "btn primary" }, "Save readings");
+  // Quiz (same for every level)
+  const quizPill = h("span", { class: "pill" });
+  const updateQuiz = () => {
+    const complete = draft.questions.every((q) => q.q.trim() && q.choices.every((c) => c.trim()) && q.correct !== null);
+    const empty = draft.questions.every((q) => !q.q.trim() && q.choices.every((c) => !c.trim()));
+    quizPill.className = `pill ${complete ? "ok" : empty ? "" : "warn"}`;
+    quizPill.textContent = complete ? "Ready" : empty ? "Empty" : "Not finished";
+  };
+  statusUpdaters.push(updateQuiz);
+  updateQuiz();
+  const qBlocks = draft.questions.map((q, qi) => {
+    const qInput = h("input", { type: "text", dir: "auto", value: q.q, placeholder: "Question" });
+    qInput.addEventListener("input", () => { q.q = qInput.value; markDirty(); });
+    const rows = q.choices.map((c, ci) => {
+      const radio = h("input", { type: "radio", name: `correct-${qi}`, checked: q.correct === ci, "aria-label": `Choice ${ci + 1} is correct` });
+      radio.addEventListener("change", () => { q.correct = ci; markDirty(); });
+      const cInput = h("input", { type: "text", dir: "auto", value: c, placeholder: `Choice ${ci + 1}` });
+      cInput.addEventListener("input", () => { q.choices[ci] = cInput.value; markDirty(); });
+      return h("div", { class: "choice-row" }, h("label", {}, radio, "Correct"), cInput);
+    });
+    return h("div", { class: "q-block" }, h("strong", {}, `Question ${qi + 1}`), qInput, ...rows);
+  });
+
+  const saveBtn = h("button", { class: "btn primary" }, "Save daily setup");
   saveBtn.addEventListener("click", () => guard(async () => {
     saveBtn.disabled = true;
     try {
-      await api("/api/teacher/day", {
-        method: "PUT",
-        body: {
-          date: draft.date,
-          material: draft.material,
-          readings: Object.entries(draft.readings).map(([levelId, r]) => ({ level_id: Number(levelId), ...r })),
-        },
-      });
+      await api("/api/teacher/day", { method: "PUT", body: draft });
       state.dirty = false;
-      toast("Readings saved");
-      await renderReadings();
+      toast("Daily setup saved");
+      await renderSetup();
     } finally {
       saveBtn.disabled = false;
     }
   }));
 
+  const copiedNote = !day.saved && day.sources_copied_from
+    ? h("p", { class: "notice" }, `Level choices copied from ${formatDate(day.sources_copied_from)}. Save to use them for this day.`)
+    : null;
+
   main.replaceChildren(
     h("header", {},
-      h("div", {}, h("h2", {}, "Readings"), h("p", { class: "muted" }, date === ov.today ? "Today’s readings" : formatDate(date))),
+      h("div", {}, h("h2", {}, "Daily setup"), h("p", { class: "muted" }, date === ov.today ? "Today" : formatDate(date))),
       h("label", { class: "field" }, h("span", {}, "Date"), dateInput)),
     h("section", { class: "panel" },
-      h("header", {}, h("h3", {}, "The day’s material")),
-      h("p", { class: "muted" }, "Paste everything being learned this day. It’s here for your reference; students only see the piece you assign to their level."),
+      h("h3", {}, "Parts today"),
+      h("p", { class: "muted" }, "Turn off anything the class isn’t doing this day. It applies to everyone."),
+      h("div", { class: "toggles" },
+        partToggle("reading", "Reading", "Students record themselves and the AI grades it"),
+        partToggle("ratings", "Review questions", "Reviewed inside, reviewed outside, hasmada"),
+        partToggle("quiz", "Quiz", "Two questions, graded automatically"))),
+    h("section", { class: "panel" },
+      h("h3", {}, "The day’s material"),
+      h("p", { class: "muted" }, "Paste the Gemara, Rashi and Tosfos for this day. Each level reads the parts you check below."),
       h("div", { class: "material-grid" }, materialArea("gemara", "Gemara"), materialArea("rashi", "Rashi"), materialArea("tosfos", "Tosfos"))),
-    ...(ov.levels.length
-      ? levelCards
-      : [h("div", { class: "panel" }, h("p", {}, "Add levels before setting readings."), h("div", {}, h("button", { class: "btn primary", onclick: () => go("levels") }, "Add levels")))]),
+    h("section", { class: "panel" },
+      h("h3", {}, "What each level reads"),
+      copiedNote,
+      ov.levels.length
+        ? h("div", { class: "table-wrap" }, h("table", {}, h("tbody", {}, levelRows)))
+        : h("div", {}, h("p", { class: "muted" }, "No levels yet."), h("button", { class: "btn primary", onclick: () => go("levels") }, "Add levels"))),
+    h("section", { class: "panel" },
+      h("header", {}, h("h3", {}, "Quiz (same for every level)"), quizPill),
+      ...qBlocks),
     h("div", { class: "save-bar" }, saveStatus, saveBtn),
   );
 }
@@ -571,6 +613,12 @@ function manualForm(a, onSaved) {
   return h("div", { class: "field" }, feedback, h("div", { class: "row-form" }, score, save));
 }
 
+function readBlock(a) {
+  return h("div", { class: "read-text", lang: "he" },
+    (a.reading_parts || []).map((p) => h("div", { class: "read-part" },
+      h("strong", { class: "read-source" }, SOURCE_HEBREW[p.source] || ""), p.text)));
+}
+
 function audioPlayer(a) {
   return a.audio_available
     ? h("audio", { controls: true, preload: "none", src: `/api/teacher/audio/${a.id}`, style: { width: "100%" } })
@@ -587,11 +635,10 @@ async function renderManual() {
       h("header", {},
         h("div", {},
           h("h3", {}, a.student_name),
-          h("span", { class: "muted" }, `${formatDate(a.date, { weekday: "short", month: "short", day: "numeric" })}, ${a.level_name || ""}, ${SOURCE_LABELS[a.source_type] || ""}, ${clock(a.duration_sec || 0)} long`)),
+          h("span", { class: "muted" }, `${formatDate(a.date, { weekday: "short", month: "short", day: "numeric" })}, ${a.level_name || ""}, ${sourcesText(a.sources)}, ${clock(a.duration_sec || 0)} long`)),
         h("span", { class: "pill warn" }, a.grading_note || "AI couldn’t grade")),
       audioPlayer(a),
-      h("details", {}, h("summary", {}, "Text they read"), h("div", { class: "read-text", lang: "he" }, a.reading_text || "")),
-      h("p", {}, `Quiz: ${quizText(a)}`),
+      h("details", {}, h("summary", {}, "Text they read"), readBlock(a)),
       manualForm(a, async () => {
         card.remove();
         await refreshOverview();
@@ -629,20 +676,37 @@ async function openDetail(id) {
   let aiSection;
   if (a.grading_status === "done") aiSection = h("div", { class: "feedback-card", dir: "auto", style: { fontSize: "1rem" } }, a.ai_score !== null && a.ai_score !== undefined ? `Score: ${a.ai_score}\n\n${a.ai_feedback}` : a.ai_feedback);
   else if (a.grading_status === "manual") aiSection = h("p", { class: "muted" }, `The AI didn’t grade this reading (${a.grading_note || "no reason given"}).`);
+  else if (a.grading_status === "waiting") aiSection = h("p", { class: "muted" }, "Not recorded yet.");
   else aiSection = h("p", { class: "muted" }, "Still grading.");
+
+  const sections = [];
+  if (a.parts.reading) {
+    sections.push(
+      h("section", {}, h("h3", {}, `Recording (${clock(a.duration_sec || 0)})`), a.recorded ? audioPlayer(a) : h("p", { class: "muted" }, "Not recorded yet.")),
+      h("section", {}, h("h3", {}, "Text they read"), readBlock(a)),
+      h("section", {}, h("h3", {}, "AI feedback (shown to the student)"), aiSection));
+  }
+  if (a.parts.ratings) {
+    sections.push(h("section", {}, h("h3", {}, "Review questions"),
+      a.ratings_done
+        ? h("table", { class: "mini" }, h("tbody", {},
+            h("tr", {}, h("td", {}, "Reviewed inside"), h("td", { class: "num" }, `${a.rating_inside} of 5`)),
+            h("tr", {}, h("td", {}, "Reviewed outside"), h("td", { class: "num" }, `${a.rating_outside} of 5`)),
+            h("tr", {}, h("td", {}, "Hasmada"), h("td", { class: "num" }, `${a.hasmada} of 10`))))
+        : h("p", { class: "muted" }, "Not answered yet.")));
+  }
+  if (a.parts.quiz) sections.push(h("section", {}, h("h3", {}, `Quiz: ${quizText(a)}`), a.quiz_done ? quiz : h("p", { class: "muted" }, "Not finished yet.")));
+  if (a.parts.reading) {
+    sections.push(h("section", {}, h("h3", {}, "Your grade for the reading (only you see this)"), manualForm(a, () => { dialog.close(); refreshOverview(); })));
+  }
 
   dialog.replaceChildren(
     h("div", { class: "dlg-head" },
       h("div", {},
         h("h2", { id: "detail-title" }, a.student_name),
-        h("span", { class: "muted" }, `${formatDate(a.date)}, ${formatTime(a.submitted_at)}, ${a.level_name || ""}, ${SOURCE_LABELS[a.source_type] || ""}`)),
+        h("span", { class: "muted" }, [formatDate(a.date), formatTime(a.completed_at || a.submitted_at), a.level_name, sourcesText(a.sources)].filter(Boolean).join(", "))),
       h("button", { class: "btn", onclick: () => dialog.close() }, "Close")),
-    h("div", { class: "dlg-body" },
-      h("section", {}, h("h3", {}, `Recording (${clock(a.duration_sec || 0)})`), audioPlayer(a)),
-      h("section", {}, h("h3", {}, "Text they read"), h("div", { class: "read-text", lang: "he" }, a.reading_text || "")),
-      h("section", {}, h("h3", {}, "AI feedback (shown to the student)"), aiSection),
-      h("section", {}, h("h3", {}, `Quiz: ${quizText(a)}`), quiz),
-      h("section", {}, h("h3", {}, "Your grade (only you see this)"), manualForm(a, () => { dialog.close(); refreshOverview(); }))),
+    h("div", { class: "dlg-body" }, sections),
   );
   dialog.showModal();
 }
@@ -694,12 +758,15 @@ async function renderReports() {
       h("td", {}, formatDate(a.date, { month: "short", day: "numeric" })),
       h("td", {}, a.student_name),
       h("td", {}, a.level_name || ""),
-      h("td", {}, SOURCE_LABELS[a.source_type] || ""),
+      h("td", {}, a.parts.reading ? sourcesText(a.sources) : "—"),
+      h("td", {}, gradePill(a)),
       h("td", {}, quizText(a)),
-      h("td", {}, gradePill(a))));
+      h("td", { class: "num" }, ratingText(a, "rating_inside")),
+      h("td", { class: "num" }, ratingText(a, "rating_outside")),
+      h("td", { class: "num" }, ratingText(a, "hasmada"))));
     results.replaceChildren(loaded.attempts.length
       ? h("div", { class: "table-wrap" }, h("table", {},
-          h("thead", {}, h("tr", {}, ["Date", "Student", "Level", "Read", "Quiz", "Reading grade"].map((t) => h("th", {}, t)))),
+          h("thead", {}, h("tr", {}, ["Date", "Student", "Level", "Read", "Reading", "Quiz", "Inside", "Outside", "Hasmada"].map((t) => h("th", {}, t)))),
           h("tbody", {}, rows)))
       : h("p", { class: "muted" }, "No results for these dates and students."));
   });
@@ -747,22 +814,26 @@ async function renderReports() {
 
 function summarize(attempts) {
   const by = new Map();
+  const nums = (x) => x !== null && x !== undefined;
   for (const a of attempts) {
-    if (!by.has(a.student_id)) by.set(a.student_id, { name: a.student_name, attempts: 0, quizzes: 0, correct: 0, total: 0, ai: [], manual: [] });
+    if (!by.has(a.student_id)) by.set(a.student_id, { name: a.student_name, days: 0, quiz: [], ai: [], manual: [], inside: [], outside: [], hasmada: [] });
     const s = by.get(a.student_id);
-    s.attempts += 1;
-    if (a.quiz_done) { s.quizzes += 1; s.correct += a.quiz_correct; s.total += a.quiz_total; }
-    if (a.ai_score !== null && a.ai_score !== undefined) s.ai.push(a.ai_score);
-    if (a.manual_score !== null && a.manual_score !== undefined) s.manual.push(a.manual_score);
+    s.days += 1;
+    if (a.quiz_done && nums(a.quiz_percent)) s.quiz.push(a.quiz_percent);
+    if (nums(a.ai_score)) s.ai.push(a.ai_score);
+    if (nums(a.manual_score)) s.manual.push(a.manual_score);
+    if (a.ratings_done) { s.inside.push(a.rating_inside); s.outside.push(a.rating_outside); s.hasmada.push(a.hasmada); }
   }
   const avg = (xs) => (xs.length ? Math.round((xs.reduce((x, y) => x + y, 0) / xs.length) * 10) / 10 : "");
   return [...by.values()].sort((x, y) => x.name.localeCompare(y.name)).map((s) => ({
     Student: s.name,
-    Readings: s.attempts,
-    "Quizzes finished": s.quizzes,
-    "Quiz average %": s.total ? Math.round((s.correct / s.total) * 100) : "",
+    Days: s.days,
+    "Average quiz %": avg(s.quiz),
     "Average AI score": avg(s.ai),
     "Average teacher score": avg(s.manual),
+    "Average inside (0-5)": avg(s.inside),
+    "Average outside (0-5)": avg(s.outside),
+    "Average hasmada (0-10)": avg(s.hasmada),
   }));
 }
 
@@ -770,21 +841,25 @@ function resultRows(attempts) {
   return attempts.map((a) => {
     const q = a.quiz || [];
     const mark = (i) => (q[i] && a.quiz_done ? (q[i].answer === q[i].correct ? "Right" : "Wrong") : "");
+    const rating = (key) => (a.ratings_done ? a[key] : "");
     return {
       Date: a.date,
       Student: a.student_name,
       Level: a.level_name || "",
-      Read: SOURCE_LABELS[a.source_type] || "",
-      "Quiz score": a.quiz_done ? `${a.quiz_correct}/${a.quiz_total}` : "Not finished",
-      "Question 1": mark(0),
-      "Question 2": mark(1),
+      Read: a.parts.reading ? sourcesText(a.sources) : "",
       "Reading status": gradeText(a),
       "AI score": a.ai_score ?? "",
       "AI feedback": a.ai_feedback || "",
       "Teacher score": a.manual_score ?? "",
       "Teacher feedback": a.manual_feedback || "",
+      "Quiz %": a.parts.quiz && a.quiz_done ? a.quiz_percent : "",
+      "Question 1": mark(0),
+      "Question 2": mark(1),
+      "Reviewed inside (0-5)": rating("rating_inside"),
+      "Reviewed outside (0-5)": rating("rating_outside"),
+      "Hasmada (0-10)": rating("hasmada"),
       "Recording length (sec)": a.duration_sec ?? "",
-      "Sent at": a.submitted_at ? new Date(a.submitted_at).toLocaleString() : "",
+      "Finished at": a.completed_at ? new Date(a.completed_at).toLocaleString() : "Not finished",
     };
   });
 }
@@ -806,9 +881,9 @@ async function exportSpreadsheet(data) {
   const results = resultRows(data.attempts);
   const summary = summarize(data.attempts);
   const resultsSheet = XLSX.utils.json_to_sheet(results.length ? results : [{ Date: "No results" }]);
-  resultsSheet["!cols"] = [10, 18, 12, 9, 11, 10, 10, 20, 9, 60, 11, 60, 12, 20].map((w) => ({ wch: w }));
+  resultsSheet["!cols"] = [10, 18, 12, 16, 20, 9, 60, 12, 60, 8, 10, 10, 12, 13, 12, 12, 20].map((w) => ({ wch: w }));
   const summarySheet = XLSX.utils.json_to_sheet(summary.length ? summary : [{ Student: "No results" }]);
-  summarySheet["!cols"] = [20, 10, 15, 14, 16, 20].map((w) => ({ wch: w }));
+  summarySheet["!cols"] = [20, 7, 14, 16, 20, 18, 19, 20].map((w) => ({ wch: w }));
   XLSX.utils.book_append_sheet(wb, summarySheet, "Summary");
   XLSX.utils.book_append_sheet(wb, resultsSheet, "Results");
   XLSX.writeFile(wb, `gemara-results-${data.from}-to-${data.to}.xlsx`);
@@ -830,7 +905,7 @@ function exportPdf(data) {
     h("h2", {}, "Summary"),
     summary.length ? table(summary, Object.keys(summary[0])) : h("p", {}, "No results."),
     h("h2", {}, "Results"),
-    results.length ? table(results, ["Date", "Student", "Level", "Read", "Quiz score", "Reading status", "AI score", "Teacher score"]) : h("p", {}, "No results."),
+    results.length ? table(results, ["Date", "Student", "Level", "Read", "Reading status", "AI score", "Teacher score", "Quiz %", "Reviewed inside (0-5)", "Reviewed outside (0-5)", "Hasmada (0-10)"]) : h("p", {}, "No results."),
     results.some((x) => x["AI feedback"] || x["Teacher feedback"]) ? h("h2", {}, "Feedback") : null,
     ...data.attempts.filter((a) => a.ai_feedback || a.manual_feedback).map((a) => h("div", { class: "fb" },
       h("strong", {}, `${a.date}, ${a.student_name}`),

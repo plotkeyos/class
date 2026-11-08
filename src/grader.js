@@ -4,8 +4,8 @@
 // Right now it sends the recording to GRADER_URL (if set) as multipart/form-data:
 //
 //   audio        the recording file (audio/mp4 from iPads)
-//   text         the exact text the student was supposed to read
-//   source_type  "gemara", "rashi" or "tosfos"
+//   text         the exact text the student was supposed to read (all their parts)
+//   source_type  which parts the text includes, e.g. "gemara,rashi"
 //   attempt_id   an id you can use for logging
 //
 // and expects a JSON reply:

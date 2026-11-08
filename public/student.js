@@ -167,18 +167,38 @@ async function start(student) {
   if (student.status === "done") {
     return showMessage(student.name, "You already finished today. Great job.", "Back to names", () => showNames());
   }
-  screen(center(spinner(), h("p", {}, "Getting your reading…")));
-  let data;
+  screen(center(spinner(), h("p", {}, "Getting today’s work…")));
+  let state;
   try {
-    data = await api("/api/student/start", { method: "POST", body: { student_id: student.id } });
+    state = await api("/api/student/start", { method: "POST", body: { student_id: student.id } });
   } catch (err) {
     return handleError(err, () => showNames(), "Back to names");
   }
-  if (data.mode === "quiz") {
-    kickGrading(data.attempt_id);
-    return showQuiz(data.student, data.attempt_id, data.questions);
+  // Coming back after sending a recording: make sure grading is running.
+  if (state.parts.reading && state.grading_status === "pending") kickGrading(state.attempt_id);
+  next({ ...state, student: state.student || student });
+}
+
+// Moves the student to whichever part comes next.
+function next(state) {
+  const ctx = { student: state.student, level: state.level, attemptId: state.attempt_id, parts: state.parts };
+  if (state.step === "reading") return showReading(ctx, state);
+  if (state.step === "ratings") return showRatings(ctx);
+  if (state.step === "quiz") return showQuiz(ctx, state.questions);
+  if (ctx.parts.reading) return showFeedback(ctx);
+  return showAllDone(ctx.student);
+}
+
+// Sends a step to the server and goes to the next part.
+async function sendStep(ctx, path, body, onError) {
+  try {
+    const state = await api(path, { method: "POST", body });
+    next({ ...state, student: ctx.student, level: ctx.level });
+  } catch (err) {
+    if (err.status === 403) return showUnlock();
+    if (err.status === 409) return showMessage(null, err.message, "Back to names", () => showNames());
+    onError(err);
   }
-  showReading(data);
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +328,8 @@ function micErrorMessage(err) {
   return "The microphone didn’t start. Tap Record to try again.";
 }
 
-function showReading({ student, level, reading, max_seconds }) {
+function showReading(ctx, { reading, max_seconds }) {
+  const { student, level } = ctx;
   requestWake();
   releaseRecorder();
 
@@ -420,16 +441,15 @@ function showReading({ student, level, reading, max_seconds }) {
     hint.textContent = "Sending your reading. Keep this screen open.";
     const ext = blob.type.includes("webm") ? "webm" : "m4a";
     const form = new FormData();
-    form.append("student_id", String(student.id));
-    form.append("reading_id", String(reading.id));
+    form.append("attempt_id", String(ctx.attemptId));
     form.append("duration", duration.toFixed(1));
     form.append("audio", blob, `reading.${ext}`);
     try {
-      const res = await api("/api/student/submit", { method: "POST", body: form });
+      const state = await api("/api/student/submit", { method: "POST", body: form });
       if (audioUrl) URL.revokeObjectURL(audioUrl);
       releaseRecorder();
-      kickGrading(res.attempt_id);
-      showQuiz(student, res.attempt_id, res.questions);
+      kickGrading(ctx.attemptId);
+      next({ ...state, student, level });
     } catch (err) {
       if (err.status === 403) return showUnlock();
       if (err.status === 409) return showMessage(null, err.message, "Back to names", () => showNames());
@@ -449,19 +469,79 @@ function showReading({ student, level, reading, max_seconds }) {
     },
   }, "Not you?");
 
+  const sourceNames = reading.parts.map((p) => SOURCE_LABELS[p.source]).join(" + ");
   screen(
-    head(student, `${level.name} · ${SOURCE_LABELS[reading.source_type] || ""}`, leave),
+    head(student, level ? `${level.name} · ${sourceNames}` : sourceNames, leave),
     h("div", { class: "reading-wrap" },
       h("article", { class: "page", lang: "he" },
-        h("div", { class: "source" }, SOURCE_HEBREW[reading.source_type] || ""),
-        h("div", { class: "text" }, reading.text))),
+        reading.parts.map((p) => h("section", { class: "part" },
+          h("div", { class: "source" }, SOURCE_HEBREW[p.source] || ""),
+          h("div", { class: "text" }, p.text))))),
     h("div", { class: "dock" },
       h("div", { class: "dock-inner" }, left, recBtn, side)),
   );
   setState("idle");
 }
 
-// Grading runs on the server while the student answers the quiz.
+// ---------------------------------------------------------------------------
+// Review questions (inside, outside, hasmada)
+// ---------------------------------------------------------------------------
+
+function scale(max, onPick) {
+  const buttons = [];
+  for (let n = 0; n <= max; n++) {
+    const b = h("button", {
+      class: "scale-btn", type: "button", role: "radio", "aria-checked": "false",
+      onclick: () => {
+        buttons.forEach((x) => x.setAttribute("aria-checked", String(x === b)));
+        onPick(n);
+      },
+    }, String(n));
+    buttons.push(b);
+  }
+  return h("div", { class: `scale scale-${max}`, role: "radiogroup" }, buttons);
+}
+
+function showRatings(ctx) {
+  requestWake();
+  const values = { inside: null, outside: null, hasmada: null };
+  const nextBtn = h("button", { class: "btn primary big", disabled: true }, "Continue");
+  const error = h("p", { class: "error-text", role: "alert" });
+  const pick = (key) => (n) => {
+    values[key] = n;
+    nextBtn.disabled = Object.values(values).some((v) => v === null);
+  };
+
+  nextBtn.addEventListener("click", () => {
+    nextBtn.disabled = true;
+    error.textContent = "";
+    sendStep(ctx, "/api/student/ratings", { attempt_id: ctx.attemptId, ...values }, (err) => {
+      error.textContent = err.message;
+      nextBtn.disabled = false;
+    });
+  });
+
+  screen(
+    head(ctx.student, "A few questions about your review", notYou()),
+    h("div", { class: "quiz" },
+      h("section", { class: "question" },
+        h("h2", {}, "How much of the material did you review inside?"),
+        scale(5, pick("inside"))),
+      h("section", { class: "question" },
+        h("h2", {}, "How much of the material did you review outside?"),
+        scale(5, pick("outside"))),
+      h("section", { class: "question" },
+        h("h2", {}, "Hasmada"),
+        scale(10, pick("hasmada"))),
+      h("div", {}, nextBtn, error)),
+  );
+}
+
+function notYou() {
+  return h("button", { class: "btn quiet", onclick: () => showNames() }, "Not you?");
+}
+
+// Grading runs on the server while the student does the other parts.
 function kickGrading(attemptId) {
   api("/api/student/grade", { method: "POST", body: { attempt_id: attemptId } }).catch(() => {});
 }
@@ -470,7 +550,7 @@ function kickGrading(attemptId) {
 // Quiz
 // ---------------------------------------------------------------------------
 
-function showQuiz(student, attemptId, questions) {
+function showQuiz(ctx, questions) {
   requestWake();
   const answers = questions.map(() => null);
   const handIn = h("button", { class: "btn primary big", disabled: true }, "Hand in answers");
@@ -492,25 +572,18 @@ function showQuiz(student, attemptId, questions) {
       h("div", { class: "choices", role: "radiogroup" }, buttons));
   });
 
-  handIn.addEventListener("click", async () => {
+  handIn.addEventListener("click", () => {
     if (!confirm("Hand in your answers? You can’t change them afterward.")) return;
     handIn.disabled = true;
     error.textContent = "";
-    try {
-      await api("/api/student/quiz", { method: "POST", body: { attempt_id: attemptId, answers } });
-    } catch (err) {
-      if (err.status === 403) return showUnlock();
-      if (err.status !== 409) {
-        error.textContent = err.message;
-        handIn.disabled = false;
-        return;
-      }
-    }
-    showFeedback(student, attemptId);
+    sendStep(ctx, "/api/student/quiz", { attempt_id: ctx.attemptId, answers }, (err) => {
+      error.textContent = err.message;
+      handIn.disabled = false;
+    });
   });
 
   screen(
-    head(student, "Two questions about what you read", h("button", { class: "btn quiet", onclick: () => showNames() }, "Not you?")),
+    head(ctx.student, "Two questions about what you learned", notYou()),
     h("div", { class: "quiz" }, blocks, h("div", {}, handIn, error)),
   );
 }
@@ -519,7 +592,8 @@ function showQuiz(student, attemptId, questions) {
 // Feedback
 // ---------------------------------------------------------------------------
 
-function showFeedback(student, attemptId) {
+function showFeedback(ctx) {
+  const { student, attemptId } = ctx;
   screen(
     head(student),
     center(spinner(), h("h1", {}, "Checking your reading…"), h("p", { class: "muted" }, "Your feedback will show here in a moment.")),
@@ -534,6 +608,7 @@ function showFeedback(student, attemptId) {
       if (err.status === 403) return showUnlock();
     }
     if (r) {
+      if (r.grading_status === "none") return showAllDone(student);
       if (!deadline) deadline = Date.now() + r.wait_seconds * 1000;
       if (r.grading_status === "done") return showGraded(student, r);
       if (r.grading_status === "manual") return showSentToTeacher(student);
@@ -557,7 +632,7 @@ function showGraded(student, result) {
     head(student),
     center(
       h("h1", {}, "Your reading feedback"),
-      result.score !== null && result.score !== undefined ? h("p", { class: "score-line" }, `Score: ${result.score}`) : null,
+      result.score !== null && result.score !== undefined ? h("p", { class: "score-line" }, `Reading score: ${result.score}`) : null,
       h("div", { class: "feedback-card", dir: "auto" }, result.feedback),
       doneButton(),
     ),
@@ -576,6 +651,15 @@ function showSentToTeacher(student) {
     ),
   );
   later(() => showNames(), 60 * 1000);
+}
+
+function showAllDone(student) {
+  releaseWake();
+  screen(
+    head(student),
+    center(h("h1", {}, "You’re done for today"), h("p", {}, "Great job."), doneButton()),
+  );
+  later(() => showNames(), 30 * 1000);
 }
 
 boot();
