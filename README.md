@@ -1,6 +1,6 @@
 # Gemara Reading (prototype)
 
-Students read a piece of Gemara, Rashi or Tosfos aloud on an iPad, an AI grades the recording while they take a 2-question quiz, and they see the AI's feedback when they finish. The teacher sets the readings, levels and students, and sees every result.
+Each day, students on the iPads do up to three parts: read their level’s Gemara, Rashi and/or Tosfos aloud (an AI grades the recording), answer three review questions (reviewed inside 0–5, reviewed outside 0–5, hasmada 0–10), and take a 2-question quiz that’s graded automatically. They see the AI’s reading feedback at the end, but not the quiz score. The teacher sets everything up and sees every result.
 
 - **Student page:** the main address (`/`)
 - **Teacher page:** `/teacher`
@@ -47,7 +47,7 @@ Optional, for testing the whole flow before the real AI exists: add a **Text** v
 2. **Settings:** set the class code. The school time zone is filled in from your device; check it's right.
 3. **Levels:** add your levels.
 4. **Students:** paste the class list, one name per line, and set each student's level.
-5. **Readings:** paste the day's material, then each level's piece and its 2 questions. Mark the correct answer. Save.
+5. **Daily setup:** choose which parts are on (all are on by default), paste the day’s Gemara, Rashi and Tosfos, check which of them each level reads, and write the 2 quiz questions (the same for every level). Mark the correct answers. Save.
 
 ### 5. Set up each iPad
 
@@ -58,10 +58,10 @@ Optional, for testing the whole flow before the real AI exists: add a **Text** v
 
 ## Daily use
 
-- **Teacher:** set the readings on the Readings tab (you can prepare days ahead with the date picker). Watch the Today tab during class. Use **Allow another try** if a student needs to redo it.
-- **Students:** tap their name, read, send, answer the 2 questions, see feedback, tap Done.
+- **Teacher:** fill in **Daily setup** (you can prepare days ahead with the date picker; each level’s checkboxes carry over from the last day you set). Turn off any part the class isn’t doing that day. Watch the **Today** tab during class. Use **Allow another try** if a student needs to redo it.
+- **Students:** tap their name, read and send the recording, answer the review questions, take the quiz, see the reading feedback, tap Done. Parts that are turned off are skipped. If a student leaves partway, they pick up where they stopped.
 - Anything the AI couldn't grade shows up under **Manual grading**. Those grades are for the teacher only.
-- **Reports:** choose dates and students, then download a spreadsheet (.xlsx) or PDF. The PDF opens the print window; choose **Save as PDF** (on iPad, **Share › Save to Files**).
+- **Reports:** choose dates and students, then download a spreadsheet (.xlsx) or PDF. Reports include the reading grade, quiz percentage, and the three review answers. The PDF opens the print window; choose **Save as PDF** (on iPad, **Share › Save to Files**).
 
 Recordings are deleted automatically after 7 days. Scores and feedback are kept.
 
@@ -72,8 +72,8 @@ Set `GRADER_URL` (Text variable) to the grader's address, and `GRADER_KEY` (Secr
 | Field | Contents |
 | --- | --- |
 | `audio` | The recording (`audio/mp4` from iPads) |
-| `text` | The exact text the student was supposed to read |
-| `source_type` | `gemara`, `rashi` or `tosfos` |
+| `text` | The exact text the student was supposed to read (all their parts, in order) |
+| `source_type` | Which parts it includes, e.g. `gemara,rashi` |
 | `attempt_id` | An id for logging |
 
 with `Authorization: Bearer <GRADER_KEY>` if a key is set. It expects JSON back:
